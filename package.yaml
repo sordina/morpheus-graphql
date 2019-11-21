@@ -35,6 +35,7 @@ dependencies:
   - uuid                  >= 1.0       && <= 1.4
   - template-haskell      >= 2.0       && <= 2.16
   - th-lift-instances
+  - wuss
 
 library:
   source-dirs: src
@@ -57,3 +58,4 @@ tests:
       - tasty
       - tasty-hunit
       - aeson
+      - wuss

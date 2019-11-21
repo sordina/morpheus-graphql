@@ -15,6 +15,7 @@ import           Data.Aeson                      (FromJSON, ToJSON (..), eitherD
 import           Data.ByteString.Lazy            (ByteString)
 import           Data.Text                       (pack)
 import           Language.Haskell.TH
+import           Data.Proxy
 
 
 import qualified Data.Aeson                      as A
@@ -45,7 +46,10 @@ class Fetch a where
       -------------------------------------------------------------
       processResponse JSONResponse {responseData = Just x} =  Right  x
       processResponse invalidResponse                      =  Left (show invalidResponse)
-  fetch :: (Monad m, FromJSON a) => (ByteString -> m ByteString) -> Args a -> m (Either String a)
+
+  fetch         :: (Monad m, FromJSON a) => (ByteString -> m ByteString) -> Args a -> m (Either String a)
+  buildRequest  :: Proxy a -> Args a -> GQLRequest
+  buildResponse :: ByteString -> m (Either String a)
 
 deriveFetch :: Type -> String -> String -> Q [Dec]
 deriveFetch resultType typeName queryString = pure <$> instanceD (cxt []) iHead methods
@@ -55,3 +59,5 @@ deriveFetch resultType typeName queryString = pure <$> instanceD (cxt []) iHead 
       [ funD 'fetch [clause [] (normalB [|__fetch queryString typeName|]) []]
       , pure $ typeInstanceDec  ''Args  (ConT $ mkName typeName) resultType
       ]
+
+

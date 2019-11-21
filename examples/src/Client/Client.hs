@@ -7,6 +7,7 @@
 {-# LANGUAGE QuasiQuotes           #-}
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TypeFamilies          #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
 
 module Client.Client
   ( fetchHero
@@ -22,10 +23,11 @@ import           Data.Morpheus.Client           ( Fetch(..)
                                                 )
 import           Data.Morpheus.Types            ( ScalarValue(..) )
 import           Data.Text                      ( Text )
+import           Network.WebSockets             (ClientApp, runClient, receiveData, sendClose, sendTextData)
 
 
 defineByDocumentFile
-  "src/Server/Sophisticated/api.gql"
+  "examples/src/Server/Sophisticated/api.gql"
   [gql|
     # Subscription Test Query
     subscription MySubscription
@@ -35,9 +37,32 @@ defineByDocumentFile
     }
   |]
 
+subscribe :: Args a
+          -> ( Either String a -> IO () )  -- callback
+          -> ClientApp ()
+subscribe args callback connection =
+  do
+    -- send initial GQL Request
+    sendTextData connection request
+
+    -- handle GQL Subscription responses
+    void . forkIO . forever $ do
+      message <- receiveData connection
+      value <- buildResponse message
+      callback value
+
+  where
+  request = encode (buildRequest (Proxy :: Args a) args)
+
+cb :: Either String MySubscription -> IO ()
+cb = print
+
+main :: IO ()
+main = runClient "127.0.0.1" 3000 "/" (subscribe () cb)
+
 
 defineByIntrospectionFile
-  "./assets/introspection.json"
+  "./examples/assets/introspection.json"
   [gql|
    
     # Query Hero with Compile time Validation
@@ -61,7 +86,7 @@ defineByIntrospectionFile
 
 
 defineByDocumentFile
-  "./assets/simple.gql"
+  "./examples/assets/simple.gql"
   [gql|
     # Query Hero with Compile time Validation
     query GetHero ($god: Realm, $someID: String!)
