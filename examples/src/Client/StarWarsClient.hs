@@ -15,7 +15,7 @@ import Data.Text                  ( Text )
 import Network.HTTP.Req
 
 defineByDocumentFile
-  "assets/starwars.graphql"
+  "examples/assets/starwars.graphql"
   [gql|
     query StarWarsFilms {
       allFilms {
