@@ -6,315 +6,228 @@
 
 module Data.Morpheus.Execution.Client.Selection
   ( operationTypes
-  )
-where
+  ) where
 
-import           Data.Maybe                     ( fromMaybe )
-import           Data.Semigroup                 ( (<>) )
-import           Data.Text                      ( Text
-                                                , pack
-                                                , unpack
-                                                )
+import           Data.Semigroup                                ((<>))
+import           Data.Text                                     (Text, pack, unpack)
+
 --
 -- MORPHEUS
-import           Data.Morpheus.Error.Client.Client
-                                                ( deprecatedField )
-import           Data.Morpheus.Error.Utils      ( globalErrorMessage )
-import           Data.Morpheus.Execution.Internal.Utils
-                                                ( nameSpaceType )
-import           Data.Morpheus.Types.Internal.AST
-                                                ( DefaultValue
-                                                , Operation(..)
-                                                , ValidOperation
-                                                , Variable(..)
-                                                , VariableDefinitions
-                                                , getOperationName
-                                                , getOperationDataType
-                                                , Selection(..)
-                                                , SelectionRec(..)
-                                                , SelectionSet
-                                                , ValidSelection
-                                                , Ref(..) 
-                                                , DataField(..)
-                                                , DataTyCon(..)
-                                                , DataType(..)
-                                                , DataTypeKind(..)
-                                                , DataTypeLib(..)
-                                                , Key
-                                                , TypeAlias(..)
-                                                , DataEnumValue(..)
-                                                , allDataTypes
-                                                , lookupType
-                                                , ConsD(..)
-                                                , ClientType(..)
-                                                , TypeD(..)
-                                                , lookupDeprecated
-                                                , lookupDeprecatedReason
-                                                )
-import           Data.Morpheus.Types.Internal.Resolving
-                                                ( GQLErrors
-                                                , Validation
-                                                , Failure(..)
-                                                , Result(..)
-                                                , Position
-                                                , LibUpdater
-                                                , resolveUpdates
-                                                )
-import           Data.Set                       ( fromList
-                                                , toList
-                                                )
+import           Data.Morpheus.Error.Utils                     (globalErrorMessage)
+import           Data.Morpheus.Execution.Internal.GraphScanner (LibUpdater, resolveUpdates)
+import           Data.Morpheus.Execution.Internal.Utils        (nameSpaceType)
+import           Data.Morpheus.Types.Internal.AST.Operation    (DefaultValue, Operation (..), ValidOperation,
+                                                                Variable (..), VariableDefinitions, getOperationName)
+import           Data.Morpheus.Types.Internal.AST.Selection    (Selection (..), SelectionRec (..), SelectionSet)
+import           Data.Morpheus.Types.Internal.Data             (DataField (..), DataFullType (..), DataLeaf (..),
+                                                                DataTyCon (..), DataTypeKind (..), DataTypeLib (..),
+                                                                Key, TypeAlias (..), allDataTypes)
+import           Data.Morpheus.Types.Internal.DataD            (ConsD (..), GQLTypeD (..), TypeD (..))
+import           Data.Morpheus.Types.Internal.Validation       (GQLErrors, Validation)
+import           Data.Morpheus.Validation.Internal.Utils       (lookupType)
+import           Data.Set                                      (fromList, toList)
 
 removeDuplicates :: [Text] -> [Text]
 removeDuplicates = toList . fromList
 
 compileError :: Text -> GQLErrors
-compileError x =
-  globalErrorMessage $ "Unhandled Compile Time Error: \"" <> x <> "\" ;"
+compileError x = globalErrorMessage $ "Unhandled Compile Time Error: \"" <> x <> "\" ;"
 
-operationTypes
-  :: DataTypeLib
-  -> VariableDefinitions
-  -> ValidOperation
-  -> Validation (Maybe TypeD, [ClientType])
+operationTypes :: DataTypeLib -> VariableDefinitions -> ValidOperation -> Validation (Maybe TypeD, [GQLTypeD])
 operationTypes lib variables = genOperation
- where
-  genOperation operation@Operation { operationName, operationSelection } = do
-    datatype            <- DataObject <$> getOperationDataType operation lib
-    (queryTypes, enums) <- genRecordType []
-                                         (getOperationName operationName)
-                                         datatype
-                                         operationSelection
-    inputTypeRequests <- resolveUpdates []
-      $ map (scanInputTypes lib . variableType . snd) variables
-    inputTypesAndEnums <- buildListedTypes (inputTypeRequests <> enums)
-    pure
-      ( rootArguments (getOperationName operationName <> "Args")
-      , queryTypes <> inputTypesAndEnums
-      )
-  -------------------------------------------------------------------------
-  buildListedTypes =
-    fmap concat . traverse (buildInputType lib) . removeDuplicates
-  -------------------------------------------------------------------------
-  -- generates argument types for Operation Head
-  rootArguments :: Text -> Maybe TypeD
-  rootArguments argsName | null variables = Nothing
-                         | otherwise      = Just rootArgumentsType
-
-   where
-    rootArgumentsType :: TypeD
-    rootArgumentsType = TypeD
-      { tName      = unpack argsName
-      , tNamespace = []
-      , tCons      = [ ConsD { cName   = unpack argsName
-                             , cFields = map fieldD variables
-                             }
-                     ]
-      , tMeta      = Nothing
-      }
-     where
-      fieldD :: (Text, Variable DefaultValue) -> DataField
-      fieldD (key, Variable { variableType, variableTypeWrappers }) = DataField
-        { fieldName     = key
-        , fieldArgs     = []
-        , fieldArgsType = Nothing
-        , fieldType     = TypeAlias { aliasWrappers = variableTypeWrappers
-                                    , aliasTyCon    = variableType
-                                    , aliasArgs     = Nothing
-                                    }
-        , fieldMeta     = Nothing
-        }
-  ---------------------------------------------------------
-  -- generates selection Object Types
-  genRecordType
-    :: [Key]
-    -> Key
-    -> DataType
-    -> SelectionSet
-    -> Validation ([ClientType], [Text])
-  genRecordType path name dataType recordSelSet = do
-    (con, subTypes, requests) <- genConsD (unpack name) dataType recordSelSet
-    pure
-      ( ClientType
-          { clientType = TypeD { tName
-                               , tNamespace = map unpack path
-                               , tCons      = [con]
-                               , tMeta      = Nothing
-                               }
-          , clientKind = KindObject Nothing
-          }
-        : subTypes
-      , requests
-      )
-   where
-    tName = unpack name
-    genConsD
-      :: String
-      -> DataType
-      -> SelectionSet
-      -> Validation (ConsD, [ClientType], [Text])
-    genConsD cName datatype selSet = do
-      (cFields, subTypes, requests) <- unzip3 <$> traverse genField selSet
-      pure (ConsD { cName, cFields }, concat subTypes, concat requests)
-     where
-      genField
-        :: (Text, ValidSelection)
-        -> Validation (DataField, [ClientType], [Text])
-      genField (fName, sel@Selection { selectionAlias, selectionPosition }) =
-        do
-          (fieldDataType, fieldType) <- lookupFieldType lib
-                                                        fieldPath
-                                                        datatype
-                                                        selectionPosition
-                                                        fName
-          (subTypes, requests) <- subTypesBySelection fieldDataType sel
-          pure
-            ( DataField { fieldName
-                        , fieldArgs     = []
-                        , fieldArgsType = Nothing
-                        , fieldType
-                        , fieldMeta     = Nothing
-                        }
-            , subTypes
-            , requests
-            )
-       where
-        fieldPath = path <> [fieldName]
-        -------------------------------
-        fieldName = fromMaybe fName selectionAlias
+  where
+    genOperation Operation {operationName, operationSelection} = do
+      (queryTypes, enums) <- genRecordType [] (getOperationName operationName) queryDataType operationSelection
+      inputTypeRequests <- resolveUpdates [] $ map (scanInputTypes lib . variableType . snd) variables
+      inputTypesAndEnums <- buildListedTypes (inputTypeRequests <> enums)
+      pure (rootArguments (getOperationName operationName <> "Args"), queryTypes <> inputTypesAndEnums)
+      where
+        queryDataType = OutputObject $ snd $ query lib
+    -------------------------------------------------------------------------
+    buildListedTypes = fmap concat . traverse (buildInputType lib) . removeDuplicates
+    -------------------------------------------------------------------------
+    -- generates argument types for Operation Head
+    rootArguments :: Text -> Maybe TypeD
+    rootArguments argsName
+      | null variables = Nothing
+      | otherwise = Just rootArgumentsType
         ------------------------------------------
-        subTypesBySelection
-          :: DataType -> ValidSelection -> Validation ([ClientType], [Text])
-        subTypesBySelection dType Selection { selectionRec = SelectionField } =
-          leafType dType
-          --withLeaf buildLeaf dType
-        subTypesBySelection dType Selection { selectionRec = SelectionSet selectionSet }
-          = genRecordType fieldPath (typeFrom [] dType) dType selectionSet
-          ---- UNION
-        subTypesBySelection dType Selection { selectionRec = UnionSelection unionSelections }
-          = do
-            (tCons, subTypes, requests) <-
-              unzip3 <$> mapM getUnionType unionSelections
-            pure
-              ( ClientType
-                  { clientType = TypeD { tNamespace = map unpack fieldPath
-                                       , tName      = unpack $ typeFrom [] dType
-                                       , tCons
-                                       , tMeta      = Nothing
-                                       }
-                  , clientKind = KindUnion
-                  }
-                : concat subTypes
-              , concat requests
-              )
-         where
-          getUnionType (selectedTyName, selectionVariant) = do
-            conDatatype <- getType lib selectedTyName
-            genConsD (unpack selectedTyName) conDatatype selectionVariant
+      where
+        rootArgumentsType :: TypeD
+        rootArgumentsType =
+          TypeD
+            { tName = unpack argsName
+            , tNamespace = []
+            , tCons = [ConsD {cName = unpack argsName, cFields = map fieldD variables}]
+            }
+          where
+            fieldD :: (Text, Variable DefaultValue) -> DataField
+            fieldD (key, Variable {variableType, variableTypeWrappers}) =
+              DataField
+                { fieldName = key
+                , fieldArgs = []
+                , fieldArgsType = Nothing
+                , fieldType =
+                    TypeAlias {aliasWrappers = variableTypeWrappers, aliasTyCon = variableType, aliasArgs = Nothing}
+                , fieldHidden = False
+                }
+    ---------------------------------------------------------
+    -- generates selection Object Types
+    genRecordType :: [Key] -> Key -> DataFullType -> SelectionSet -> Validation ([GQLTypeD], [Text])
+    genRecordType path name dataType recordSelSet = do
+      (con, subTypes, requests) <- genConsD (unpack name) dataType recordSelSet
+      pure
+        ( GQLTypeD
+            { typeD = TypeD {tName, tNamespace = map unpack path, tCons = [con]}
+            , typeKindD = KindObject Nothing
+            , typeArgD = []
+            } :
+          subTypes
+        , requests)
+      where
+        tName = unpack name
+        genConsD :: String -> DataFullType -> SelectionSet -> Validation (ConsD, [GQLTypeD], [Text])
+        genConsD cName datatype selSet = do
+          cFields <- traverse genField selSet
+          (subTypes, requests) <- newFieldTypes datatype selSet
+          pure (ConsD {cName, cFields}, concat subTypes, concat requests)
+          ---------------------------------------------------------------------------------------------
+          where
+            genField :: (Text, Selection) -> Validation DataField
+            genField (fieldName, sel) = genFieldD sel
+              where
+                fieldPath = path <> [fieldName]
+                -------------------------------
+                genFieldD Selection {selectionRec = SelectionAlias {aliasFieldName}} = do
+                  fieldType <- snd <$> lookupFieldType lib fieldPath datatype aliasFieldName
+                  pure $ DataField {fieldName, fieldArgs = [], fieldArgsType = Nothing, fieldType, fieldHidden = False}
+                genFieldD _ = do
+                  fieldType <- snd <$> lookupFieldType lib fieldPath datatype fieldName
+                  pure $ DataField {fieldName, fieldArgs = [], fieldArgsType = Nothing, fieldType, fieldHidden = False}
+            ------------------------------------------------------------------------------------------------------------
+            newFieldTypes :: DataFullType -> SelectionSet -> Validation ([[GQLTypeD]], [[Text]])
+            newFieldTypes parentType seSet = unzip <$> mapM valSelection seSet
+              where
+                valSelection selection@(selKey, _) = do
+                  let (key, sel) = getSelectionFieldKey selection
+                  fieldDatatype <- fst <$> lookupFieldType lib fieldPath parentType key
+                  validateSelection fieldDatatype sel
+                  --------------------------------------------------------------------
+                  where
+                    fieldPath = path <> [selKey]
+                    --------------------------------------------------------------------
+                    validateSelection :: DataFullType -> Selection -> Validation ([GQLTypeD], [Text])
+                    validateSelection dType Selection {selectionRec = SelectionField} = do
+                      lName <- withLeaf (pure . leafName) dType
+                      pure ([], lName)
+                    --withLeaf buildLeaf dType
+                    validateSelection dType Selection {selectionRec = SelectionSet selectionSet} =
+                      genRecordType fieldPath (typeFrom [] dType) dType selectionSet
+                    validateSelection dType aliasSel@Selection {selectionRec = SelectionAlias {aliasSelection}} =
+                      validateSelection dType aliasSel {selectionRec = aliasSelection}
+                    ---- UNION
+                    validateSelection dType Selection {selectionRec = UnionSelection unionSelections} = do
+                      (tCons, subTypes, requests) <- unzip3 <$> mapM getUnionType unionSelections
+                      pure
+                        ( GQLTypeD
+                            { typeD =
+                                TypeD {tNamespace = map unpack fieldPath, tName = unpack $ typeFrom [] dType, tCons}
+                            , typeKindD = KindUnion
+                            , typeArgD = []
+                            } :
+                          concat subTypes
+                        , concat requests)
+                      where
+                        getUnionType (selectedTyName, selectionVariant) = do
+                          conDatatype <- getType lib selectedTyName
+                          genConsD (unpack selectedTyName) conDatatype selectionVariant
 
 scanInputTypes :: DataTypeLib -> Key -> LibUpdater [Key]
-scanInputTypes lib name collected | name `elem` collected = pure collected
-                                  | otherwise = getType lib name >>= scanType
- where
-  scanType (DataInputObject DataTyCon { typeData }) = resolveUpdates
-    (name : collected)
-    (map toInputTypeD typeData)
-   where
-    toInputTypeD :: (Text, DataField) -> LibUpdater [Key]
-    toInputTypeD (_, DataField { fieldType = TypeAlias { aliasTyCon } }) =
-      scanInputTypes lib aliasTyCon
-  scanType (DataEnum DataTyCon { typeName }) = pure (collected <> [typeName])
-  scanType _ = pure collected
+scanInputTypes lib name collected
+  | name `elem` collected = pure collected
+  | otherwise = getType lib name >>= scanType
+  where
+    scanType (InputObject DataTyCon {typeData}) = resolveUpdates (name : collected) (map toInputTypeD typeData)
+      where
+        toInputTypeD :: (Text, DataField) -> LibUpdater [Key]
+        toInputTypeD (_, DataField {fieldType = TypeAlias {aliasTyCon}}) = scanInputTypes lib aliasTyCon
+    scanType (Leaf leaf) = pure (collected <> leafName leaf)
+    scanType _ = pure collected
 
-buildInputType :: DataTypeLib -> Text -> Validation [ClientType]
+buildInputType :: DataTypeLib -> Text -> Validation [GQLTypeD]
 buildInputType lib name = getType lib name >>= subTypes
- where
-  subTypes (DataInputObject DataTyCon { typeName, typeData }) = do
-    fields <- traverse toFieldD typeData
-    pure
-      [ ClientType
-          { clientType =
-            TypeD
-              { tName      = unpack typeName
-              , tNamespace = []
-              , tCons = [ConsD { cName = unpack typeName, cFields = fields }]
-              , tMeta      = Nothing
-              }
-          , clientKind = KindInputObject
-          }
-      ]
+  where
+    subTypes (InputObject DataTyCon {typeName, typeData}) = do
+      fields <- traverse toFieldD typeData
+      pure
+        [ GQLTypeD
+            { typeD =
+                TypeD
+                  { tName = unpack typeName
+                  , tNamespace = []
+                  , tCons = [ConsD {cName = unpack typeName, cFields = fields}]
+                  }
+            , typeArgD = []
+            , typeKindD = KindInputObject
+            }
+        ]
+          ----------------------------------------------------------------
+      where
+        toFieldD :: (Text, DataField) -> Validation DataField
+        toFieldD (_, field@DataField {fieldType}) = do
+          aliasTyCon <- typeFrom [] <$> getType lib (aliasTyCon fieldType)
+          pure $ field {fieldType = fieldType {aliasTyCon}}
+    subTypes (Leaf (LeafEnum DataTyCon {typeName, typeData})) =
+      pure
+        [ GQLTypeD
+            { typeD = TypeD {tName = unpack typeName, tNamespace = [], tCons = map enumOption typeData}
+            , typeArgD = []
+            , typeKindD = KindEnum
+            }
+        ]
+      where
+        enumOption eName = ConsD {cName = unpack eName, cFields = []}
+    subTypes _ = pure []
 
-   where
-    toFieldD :: (Text, DataField) -> Validation DataField
-    toFieldD (_, field@DataField { fieldType }) = do
-      aliasTyCon <- typeFrom [] <$> getType lib (aliasTyCon fieldType)
-      pure $ field { fieldType = fieldType { aliasTyCon } }
-  subTypes (DataEnum DataTyCon { typeName, typeData }) = pure
-    [ ClientType
-        { clientType = TypeD { tName      = unpack typeName
-                             , tNamespace = []
-                             , tCons      = map enumOption typeData
-                             , tMeta      = Nothing
-                             }
-        , clientKind = KindEnum
-        }
-    ]
-   where
-    enumOption DataEnumValue { enumName } =
-      ConsD { cName = unpack enumName, cFields = [] }
-  subTypes _ = pure []
+lookupFieldType :: DataTypeLib -> [Key] -> DataFullType -> Text -> Validation (DataFullType, TypeAlias)
+lookupFieldType lib path (OutputObject DataTyCon {typeData}) key =
+  case lookup key typeData of
+    Just DataField {fieldType = alias@TypeAlias {aliasTyCon}} -> trans <$> getType lib aliasTyCon
+      where trans x = (x, alias {aliasTyCon = typeFrom path x, aliasArgs = Nothing})
+    Nothing -> Left (compileError $ key <> " - during lookupFieldType OutputObject")
+lookupFieldType _ _ _ key = Left (compileError  $ key <> " - during lookupFieldType ... other")
 
+getSelectionFieldKey :: (Key, Selection) -> (Key, Selection)
+getSelectionFieldKey (_, selection@Selection {selectionRec = SelectionAlias {aliasFieldName, aliasSelection}}) =
+  (aliasFieldName, selection {selectionRec = aliasSelection})
+getSelectionFieldKey sel = sel
 
-lookupFieldType
-  :: DataTypeLib
-  -> [Key]
-  -> DataType
-  -> Position
-  -> Text
-  -> Validation (DataType, TypeAlias)
-lookupFieldType lib path (DataObject DataTyCon { typeData, typeName }) refPosition key
-  = case lookup key typeData of
-    Just DataField { fieldType = alias@TypeAlias { aliasTyCon }, fieldMeta } ->
-      checkDeprecated >> (trans <$> getType lib aliasTyCon)
-     where
-      trans x =
-        (x, alias { aliasTyCon = typeFrom path x, aliasArgs = Nothing })
-      ------------------------------------------------------------------
-      checkDeprecated :: Validation ()
-      checkDeprecated = case fieldMeta >>= lookupDeprecated of
-        Just deprecation -> Success { result = (), warnings, events = [] }
-         where
-          warnings = deprecatedField typeName
-                                     Ref { refName = key, refPosition }
-                                     (lookupDeprecatedReason deprecation)
-        Nothing -> pure ()
-    ------------------
-    Nothing -> failure
-      (compileError $ "cant find field \"" <> pack (show typeData) <> "\"")
-lookupFieldType _ _ dt _ _ =
-  failure (compileError $ "Type should be output Object \"" <> pack (show dt))
+withLeaf :: (DataLeaf -> Validation b) -> DataFullType -> Validation b
+withLeaf f (Leaf x) = f x
+withLeaf _ _        = Left $ compileError "Invalid schema Expected scalar"
 
+leafName :: DataLeaf -> [Text]
+leafName (LeafEnum DataTyCon {typeName}) = [typeName]
+leafName _                               = []
 
-leafType :: DataType -> Validation ([ClientType], [Text])
-leafType (DataEnum DataTyCon { typeName }) = pure ([], [typeName])
-leafType DataScalar{} = pure ([], [])
-leafType _ = failure $ compileError "Invalid schema Expected scalar"
+getType :: DataTypeLib -> Text -> Validation DataFullType
+getType lib typename = lookupType (compileError $ typename <> " - during getType") (allDataTypes lib) typename
 
-getType :: DataTypeLib -> Text -> Validation DataType
-getType lib typename =
-  lookupType (compileError typename) (allDataTypes lib) typename
+isPrimitive :: Text -> Bool
+isPrimitive "Boolean" = True
+isPrimitive "Int"     = True
+isPrimitive "Float"   = True
+isPrimitive "String"  = True
+isPrimitive "ID"      = True
+isPrimitive _         = False
 
-typeFromScalar :: Text -> Text
-typeFromScalar "Boolean" = "Bool"
-typeFromScalar "Int"     = "Int"
-typeFromScalar "Float"   = "Float"
-typeFromScalar "String"  = "Text"
-typeFromScalar "ID"      = "ID"
-typeFromScalar _         = "ScalarValue"
-
-typeFrom :: [Key] -> DataType -> Text
-typeFrom _ (DataScalar DataTyCon { typeName }) = typeFromScalar typeName
-typeFrom _ (DataEnum x) = typeName x
-typeFrom _ (DataInputObject x) = typeName x
-typeFrom path (DataObject x) = pack $ nameSpaceType path $ typeName x
-typeFrom path (DataUnion x) = pack $ nameSpaceType path $ typeName x
-typeFrom _ (DataInputUnion x) = typeName x
+typeFrom :: [Key] -> DataFullType -> Text
+typeFrom _ (Leaf (BaseScalar x)) = typeName x
+typeFrom _ (Leaf (CustomScalar DataTyCon {typeName}))
+  | isPrimitive typeName = typeName
+  | otherwise = "ScalarValue"
+typeFrom _ (Leaf (LeafEnum x)) = typeName x
+typeFrom _ (InputObject x) = typeName x
+typeFrom path (OutputObject x) = pack $ nameSpaceType path $ typeName x
+typeFrom path (Union x) = pack $ nameSpaceType path $ typeName x
+typeFrom _ (InputUnion x) = typeName x
